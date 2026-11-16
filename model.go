@@ -1,10 +1,5 @@
 package weatherapi
 
-type Config struct {
-	URL string `json:"url" mapstructure:"url"`
-	Key string `json:"key" mapstructure:"key"`
-}
-
 // Payload represents the response from the weatherapi.com API
 type Payload struct {
 	Location Location `json:"location"`
