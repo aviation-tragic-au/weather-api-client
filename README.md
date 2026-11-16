@@ -6,31 +6,54 @@ Provides a client for the Weather API.
 
 https://www.weatherapi.com/
 
+## Install
+
+```sh
+go get github.com/aviation-tragic-au/weather-api-client
+```
+
 ## Usage
 
-### Configuration
+```go
+import (
+    "context"
+    "errors"
+    "log"
 
-The client is configured via [Viper](https://github.com/spf13/viper), which supports both a `config.json` file and environment variables.
+    weatherapi "github.com/aviation-tragic-au/weather-api-client"
+    "go.uber.org/zap"
+)
 
-#### config.json
+func main() {
+    logger, _ := zap.NewProduction()
 
-```json
-{
-  "feed": {
-    "weatherapi": {
-      "url": "https://api.weatherapi.com/v1/",
-      "key": "your_weather_api_key"
+    // URL defaults to https://api.weatherapi.com/v1. Set KeyFunc instead
+    // of Key to look the key up on every request (to pick up a key changed
+    // at runtime), and HTTPClient to use your own transport or timeout (the
+    // default times out after 10 seconds).
+    client, err := weatherapi.NewClient(logger, weatherapi.Config{
+        Key: "your-api-key",
+    })
+    if err != nil {
+        log.Fatal(err)
     }
-  }
+
+    weather, err := client.GetCurrentForecast(context.Background(), -27.3842, 153.1175)
+    var apiErr *weatherapi.APIError
+    switch {
+    case errors.As(err, &apiErr):
+        log.Fatalf("WeatherAPI said no: %d %s", apiErr.Code, apiErr.Message)
+    case err != nil:
+        log.Fatal(err)
+    }
+
+    log.Printf("%s: %.1f°C, %s", weather.Location.Name, weather.Current.TempCelsius, weather.Current.Condition.Text)
 }
 ```
 
-#### Environment Variables
-
-| Variable              | Description             |
-|-----------------------|-------------------------|
-| `FEED_WEATHERAPI_URL` | WeatherAPI Endpoint URL |
-| `FEED_WEATHERAPI_KEY` | WeatherAPI key          |
+A non-200 response is an `*APIError` carrying the HTTP status and
+WeatherAPI's own [error code](https://www.weatherapi.com/docs/#intro-error-codes)
+and message.
 
 ## Contributing
 

@@ -1,100 +1,178 @@
+// Package weatherapi is a client for WeatherAPI.com
+// (https://www.weatherapi.com), whose free plan gives the current weather
+// at a latitude and longitude.
 package weatherapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
-	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
 const (
-	Namespace               = "feed.weatherapi"
-	currentForecastEndpoint = "/current.json"
+	// DefaultURL is WeatherAPI's API base, used when Config.URL is empty.
+	DefaultURL = "https://api.weatherapi.com/v1"
+
+	// DefaultTimeout bounds a request when Config.HTTPClient is unset.
+	DefaultTimeout = 10 * time.Second
+
+	currentEndpoint = "/current.json"
+
+	// maxErrorBody caps how much of an unrecognised error response is
+	// quoted in the error.
+	maxErrorBody = 512
 )
 
-// BindEnvs registers environment variable mappings for this feed's config namespace.
-func BindEnvs(v *viper.Viper) {
-	_ = v.BindEnv("feed.weatherapi.url", "FEED_WEATHERAPI_URL")
-	_ = v.BindEnv("feed.weatherapi.key", "FEED_WEATHERAPI_KEY")
+// Config configures a Client. Only a key (Key or KeyFunc) is required. The
+// mapstructure tags let a host decode it straight from viper or similar.
+type Config struct {
+	// URL is the API base. Empty means DefaultURL.
+	URL string `json:"url" mapstructure:"url"`
+
+	// Key is the API key.
+	Key string `json:"key" mapstructure:"key"`
+
+	// KeyFunc, when set, is called for every request in place of Key, so
+	// a host can change the key (from a settings page, say) without
+	// building a new client.
+	KeyFunc func() string `json:"-" mapstructure:"-"`
+
+	// HTTPClient sends the requests. Nil means a client with
+	// DefaultTimeout.
+	HTTPClient *http.Client `json:"-" mapstructure:"-"`
 }
 
-// Client for the WeatherAPI feed
+// APIError is an error WeatherAPI reported, with its HTTP status and its
+// own error code (1006 is "no matching location", 2006 an invalid key;
+// see https://www.weatherapi.com/docs/#intro-error-codes).
+type APIError struct {
+	StatusCode int    `json:"-"`
+	Code       int    `json:"code"`
+	Message    string `json:"message"`
+}
+
+// Error implements error.
+func (e *APIError) Error() string {
+	return fmt.Sprintf("weatherapi: status %d, code %d: %s", e.StatusCode, e.Code, e.Message)
+}
+
+// Client is a client for WeatherAPI. It is safe for concurrent use.
 type Client struct {
-	logger *zap.Logger
-	URL    string
-	Key    string
+	logger     *zap.Logger
+	httpClient *http.Client
+	url        string
+	key        func() string
 }
 
-// NewClient creates a new WeatherAPI client
-func NewClient(logger *zap.Logger, cfg *Config) (*Client, error) {
+// NewClient creates a WeatherAPI client. A nil logger logs nothing.
+func NewClient(logger *zap.Logger, cfg Config) (*Client, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	base := strings.TrimRight(cfg.URL, "/")
+	if base == "" {
+		base = DefaultURL
+	}
+	if _, err := url.Parse(base); err != nil {
+		return nil, fmt.Errorf("weatherapi: invalid URL: %w", err)
+	}
+
+	key := cfg.KeyFunc
+	if key == nil {
+		static := cfg.Key
+		key = func() string { return static }
+	}
+
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: DefaultTimeout}
+	}
+
 	return &Client{
-		logger: logger.Named(Namespace),
-		URL:    cfg.URL,
-		Key:    cfg.Key,
+		logger:     logger.Named("weatherapi"),
+		httpClient: httpClient,
+		url:        base,
+		key:        key,
 	}, nil
 }
 
-// GetCurrentForecast retrieves the current weather forecast based on latitude and longitude.
-func (c *Client) GetCurrentForecast(latitude float64, longitude float64) (*Payload, error) {
-	req, err := c.getRequest(currentForecastEndpoint)
-	if err != nil {
-		return nil, err
+// GetCurrentForecast returns the current weather at a latitude and
+// longitude. An error WeatherAPI reports comes back as an *APIError.
+func (c *Client) GetCurrentForecast(ctx context.Context, latitude, longitude float64) (*Payload, error) {
+	if !validCoordinate(latitude, 90) || !validCoordinate(longitude, 180) {
+		return nil, fmt.Errorf("weatherapi: invalid coordinates %v,%v", latitude, longitude)
 	}
 
-	// Add query parameters to the request.
-	c.addQueryParams(req, map[string]string{
-		"q":   fmt.Sprintf("%.8f,%.8f", latitude, longitude),
-		"key": c.Key,
-	})
-
-	// Send the request.
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
+	key := c.key()
+	if key == "" {
+		return nil, errors.New("weatherapi: no API key set")
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			return
-		}
-	}(res.Body)
 
-	// Read the response body.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+currentEndpoint, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("weatherapi: unable to build request: %w", err)
+	}
+
+	query := req.URL.Query()
+	query.Set("q", fmt.Sprintf("%.8f,%.8f", latitude, longitude))
+	query.Set("key", key)
+	req.URL.RawQuery = query.Encode()
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("weatherapi: request failed: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("weatherapi: unable to read response: %w", err)
 	}
 
-	// Parse the JSON response.
-	var output Payload
-	if err := json.Unmarshal(body, &output); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	// Without this check an error (a bad key, say) decoded into an empty
+	// Payload and came back as current weather.
+	if res.StatusCode != http.StatusOK {
+		return nil, apiError(res.StatusCode, body)
 	}
 
-	return &output, nil
+	var payload Payload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		c.logger.Debug("unable to parse response", zap.ByteString("body", body))
+		return nil, fmt.Errorf("weatherapi: unable to parse response: %w", err)
+	}
+
+	return &payload, nil
 }
 
-// getRequest creates a new HTTP GET request for a specific API path.
-func (c *Client) getRequest(path string) (*http.Request, error) {
-	url := fmt.Sprintf("%s%s", c.URL, path)
-	req, err := http.NewRequest("GET", url, nil)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+// apiError reads WeatherAPI's {"error": {"code", "message"}} body, falling
+// back to the start of the body when it isn't in that shape.
+func apiError(status int, body []byte) *APIError {
+	var envelope struct {
+		Error *APIError `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) == nil && envelope.Error != nil {
+		envelope.Error.StatusCode = status
+		return envelope.Error
 	}
 
-	return req, nil
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > maxErrorBody {
+		msg = msg[:maxErrorBody] + "..."
+	}
+	return &APIError{StatusCode: status, Message: msg}
 }
 
-// addQueryParams adds query parameters to the given request.
-func (c *Client) addQueryParams(req *http.Request, params map[string]string) {
-	query := req.URL.Query()
-	for key, value := range params {
-		query.Add(key, value)
-	}
-
-	req.URL.RawQuery = query.Encode()
+// validCoordinate reports whether v is a finite number within ±limit.
+func validCoordinate(v, limit float64) bool {
+	return !math.IsNaN(v) && v >= -limit && v <= limit
 }

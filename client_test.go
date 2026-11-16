@@ -1,291 +1,173 @@
 package weatherapi
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 )
 
-// TestNewClient tests the NewClient constructor
 func TestNewClient(t *testing.T) {
-	client, err := NewClient(zap.NewNop(), &Config{URL: "https://api.weatherapi.com", Key: "test-key"})
+	t.Run("defaults", func(t *testing.T) {
+		c, err := NewClient(nil, Config{Key: "k"})
+		require.NoError(t, err)
+		assert.Equal(t, DefaultURL, c.url)
+		assert.Equal(t, DefaultTimeout, c.httpClient.Timeout)
+		assert.Equal(t, "k", c.key())
+	})
 
+	t.Run("trailing slash trimmed", func(t *testing.T) {
+		c, err := NewClient(nil, Config{URL: "https://api.weatherapi.com/v1/", Key: "k"})
+		require.NoError(t, err)
+		assert.Equal(t, "https://api.weatherapi.com/v1", c.url)
+	})
+
+	t.Run("invalid URL", func(t *testing.T) {
+		_, err := NewClient(nil, Config{URL: "http://bad\x7f", Key: "k"})
+		require.Error(t, err)
+	})
+
+	t.Run("own HTTP client", func(t *testing.T) {
+		hc := &http.Client{}
+		c, err := NewClient(nil, Config{Key: "k", HTTPClient: hc})
+		require.NoError(t, err)
+		assert.Same(t, hc, c.httpClient)
+	})
+}
+
+func TestGetCurrentForecast(t *testing.T) {
+	tests := []struct {
+		name     string
+		lat, lon float64
+		status   int
+		body     string
+		wantAPI  *APIError // an *APIError with these fields
+		errText  string    // a substring of any other error
+		wantTemp float64
+	}{
+		{
+			name: "success", lat: -27.3842, lon: 153.1175, status: 200,
+			body:     `{"location":{"name":"Brisbane"},"current":{"temp_c":25.5,"condition":{"text":"Sunny"}}}`,
+			wantTemp: 25.5,
+		},
+		{name: "zero coordinates", lat: 0, lon: 0, status: 200, body: `{"current":{"temp_c":1}}`, wantTemp: 1},
+		{name: "edges", lat: -90, lon: 180, status: 200, body: `{"current":{"temp_c":-40}}`, wantTemp: -40},
+		{
+			name: "no location", lat: 1, lon: 1, status: 400,
+			body:    `{"error":{"code":1006,"message":"No matching location found."}}`,
+			wantAPI: &APIError{StatusCode: 400, Code: 1006, Message: "No matching location found."},
+		},
+		{
+			name: "invalid key", lat: 1, lon: 1, status: 401,
+			body:    `{"error":{"code":2006,"message":"API key is invalid."}}`,
+			wantAPI: &APIError{StatusCode: 401, Code: 2006, Message: "API key is invalid."},
+		},
+		{
+			name: "unrecognised error body", lat: 1, lon: 1, status: 502, body: "<html>bad gateway</html>",
+			wantAPI: &APIError{StatusCode: 502, Message: "<html>bad gateway</html>"},
+		},
+		{name: "invalid JSON", lat: 1, lon: 1, status: 200, body: "not json", errText: "unable to parse response"},
+		{name: "latitude out of range", lat: 91, lon: 0, errText: "invalid coordinates"},
+		{name: "longitude out of range", lat: 0, lon: -180.5, errText: "invalid coordinates"},
+		{name: "NaN", lat: math.NaN(), lon: 0, errText: "invalid coordinates"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/v1/current.json", r.URL.Path)
+				assert.Equal(t, "secret", r.URL.Query().Get("key"))
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(nil, Config{URL: srv.URL + "/v1", Key: "secret"})
+			require.NoError(t, err)
+
+			payload, err := c.GetCurrentForecast(context.Background(), tt.lat, tt.lon)
+
+			switch {
+			case tt.wantAPI != nil:
+				var apiErr *APIError
+				require.True(t, errors.As(err, &apiErr), "want *APIError, got %v", err)
+				assert.Equal(t, tt.wantAPI, apiErr)
+				assert.Nil(t, payload)
+			case tt.errText != "":
+				require.ErrorContains(t, err, tt.errText)
+				assert.Nil(t, payload)
+			default:
+				require.NoError(t, err)
+				assert.InDelta(t, tt.wantTemp, payload.Current.TempCelsius, 0.001)
+			}
+		})
+	}
+}
+
+func TestGetCurrentForecastQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "-27.38420000,153.11750000", r.URL.Query().Get("q"))
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(nil, Config{URL: srv.URL, Key: "k"})
 	require.NoError(t, err)
-	assert.NotNil(t, client)
-	assert.Equal(t, "https://api.weatherapi.com", client.URL)
-	assert.Equal(t, "test-key", client.Key)
-	assert.NotNil(t, client.logger)
+
+	_, err = c.GetCurrentForecast(context.Background(), -27.3842, 153.1175)
+	require.NoError(t, err)
 }
 
-// TestGetCurrentForecast_Success tests successful forecast retrieval
-func TestGetCurrentForecast_Success(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/current.json", r.URL.Path)
-		assert.Equal(t, "40.71280000,74.00600000", r.URL.Query().Get("q"))
-		assert.Equal(t, "test-key", r.URL.Query().Get("key"))
-
-		response := Payload{
-			Current: Current{
-				TempCelsius:    25.5,
-				TempFahrenheit: 77.9,
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			return
-		}
+func TestKeyFuncReadPerRequest(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Query().Get("key"))
+		_, _ = w.Write([]byte(`{}`))
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	payload, err := client.GetCurrentForecast(40.7128, 74.0060)
-
-	assert.NoError(t, err)
-	assert.NotNil(t, payload)
-	assert.Equal(t, 25.5, payload.Current.TempCelsius)
-	assert.Equal(t, 77.9, payload.Current.TempFahrenheit)
-}
-
-// TestGetCurrentForecast_InvalidJSON tests handling of invalid JSON response
-func TestGetCurrentForecast_InvalidJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("invalid json"))
-	}))
-	defer server.Close()
-
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	payload, err := client.GetCurrentForecast(40.7128, 74.0060)
-
-	assert.Error(t, err)
-	assert.Nil(t, payload)
-	assert.Contains(t, err.Error(), "failed to unmarshal JSON")
-}
-
-// TestGetCurrentForecast_HTTPError tests HTTP request failure
-func TestGetCurrentForecast_HTTPError(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "http://invalid-url-that-does-not-exist",
-		Key:    "test-key",
-	}
-
-	payload, err := client.GetCurrentForecast(40.7128, 74.0060)
-
-	assert.Error(t, err)
-	assert.Nil(t, payload)
-	assert.Contains(t, err.Error(), "failed to execute request")
-}
-
-// TestGetCurrentForecast_ZeroCoordinates tests with zero coordinates
-func TestGetCurrentForecast_ZeroCoordinates(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "0.00000000,0.00000000", r.URL.Query().Get("q"))
-		response := Payload{}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			return
-		}
-	}))
-	defer server.Close()
-
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	payload, err := client.GetCurrentForecast(0, 0)
-
-	assert.NoError(t, err)
-	assert.NotNil(t, payload)
-}
-
-// TestGetCurrentForecast_NegativeCoordinates tests with negative coordinates
-func TestGetCurrentForecast_NegativeCoordinates(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "-33.86880000,-151.20550000", r.URL.Query().Get("q"))
-		response := Payload{}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			return
-		}
-	}))
-	defer server.Close()
-
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	payload, err := client.GetCurrentForecast(-33.8688, -151.2055)
-
-	assert.NoError(t, err)
-	assert.NotNil(t, payload)
-}
-
-// TestGetRequest_Success tests successful request creation
-func TestGetRequest_Success(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.weatherapi.com",
-		Key:    "test-key",
-	}
-
-	req, err := client.getRequest("/current.json")
-
-	assert.NoError(t, err)
-	assert.NotNil(t, req)
-	assert.Equal(t, "GET", req.Method)
-	assert.Equal(t, "https://api.weatherapi.com/current.json", req.URL.String())
-}
-
-// TestGetRequest_InvalidURL tests request creation with invalid URL
-func TestGetRequest_InvalidURL(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "ht!tp://invalid",
-		Key:    "test-key",
-	}
-
-	req, err := client.getRequest("/current.json")
-
-	assert.Error(t, err)
-	assert.Nil(t, req)
-	assert.Contains(t, err.Error(), "failed to create request")
-}
-
-// TestAddQueryParams_SingleParam tests adding a single query parameter
-func TestAddQueryParams_SingleParam(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.weatherapi.com",
-		Key:    "test-key",
-	}
-
-	req, _ := client.getRequest("/current.json")
-	client.addQueryParams(req, map[string]string{"key": "test-key"})
-
-	assert.Equal(t, "key=test-key", req.URL.RawQuery)
-}
-
-// TestAddQueryParams_MultipleParams tests adding multiple query parameters
-func TestAddQueryParams_MultipleParams(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.weatherapi.com",
-		Key:    "test-key",
-	}
-
-	req, _ := client.getRequest("/current.json")
-	client.addQueryParams(req, map[string]string{
-		"q":   "40.7128,74.0060",
-		"key": "test-key",
+	var n atomic.Int32
+	keys := []string{"first", "second"}
+	c, err := NewClient(nil, Config{
+		URL:     srv.URL,
+		Key:     "ignored",
+		KeyFunc: func() string { return keys[n.Add(1)-1] },
 	})
+	require.NoError(t, err)
 
-	query := req.URL.Query()
-	assert.Equal(t, "40.7128,74.0060", query.Get("q"))
-	assert.Equal(t, "test-key", query.Get("key"))
+	_, _ = c.GetCurrentForecast(context.Background(), 0, 0)
+	_, _ = c.GetCurrentForecast(context.Background(), 0, 0)
+
+	assert.Equal(t, []string{"first", "second"}, seen)
 }
 
-// TestAddQueryParams_EmptyParams tests adding empty parameters
-func TestAddQueryParams_EmptyParams(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.weatherapi.com",
-		Key:    "test-key",
-	}
+func TestGetCurrentForecastNoKey(t *testing.T) {
+	c, err := NewClient(nil, Config{URL: "http://unused.test"})
+	require.NoError(t, err)
 
-	req, _ := client.getRequest("/current.json")
-	client.addQueryParams(req, map[string]string{})
-
-	assert.Equal(t, "", req.URL.RawQuery)
+	_, err = c.GetCurrentForecast(context.Background(), 0, 0)
+	require.ErrorContains(t, err, "no API key set")
 }
 
-// TestAddQueryParams_SpecialCharacters tests adding parameters with special characters
-func TestAddQueryParams_SpecialCharacters(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.weatherapi.com",
-		Key:    "test-key",
-	}
-
-	req, _ := client.getRequest("/current.json")
-	client.addQueryParams(req, map[string]string{
-		"q": "San Francisco, CA",
-	})
-
-	query := req.URL.Query()
-	assert.Equal(t, "San Francisco, CA", query.Get("q"))
-}
-
-// TestGetCurrentForecast_ResponseBodyClose tests proper response body closure
-func TestGetCurrentForecast_ResponseBodyClose(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := Payload{
-			Current: Current{
-				TempCelsius: 20.0,
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			return
-		}
+func TestGetCurrentForecastCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
+	c, err := NewClient(nil, Config{URL: srv.URL, Key: "k"})
+	require.NoError(t, err)
 
-	payload, err := client.GetCurrentForecast(40.7128, 74.0060)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
 
-	assert.NoError(t, err)
-	assert.NotNil(t, payload)
-}
-
-// TestGetCurrentForecast_LargeCoordinates tests with large coordinate values
-func TestGetCurrentForecast_LargeCoordinates(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := Payload{}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			return
-		}
-	}))
-	defer server.Close()
-
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	payload, err := client.GetCurrentForecast(89.99999999, 179.99999999)
-
-	assert.NoError(t, err)
-	assert.NotNil(t, payload)
+	_, err = c.GetCurrentForecast(ctx, 0, 0)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
