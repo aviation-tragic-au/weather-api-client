@@ -1,4 +1,4 @@
-module github.com/deanstalker-stream/weather-api-client
+module github.com/aviation-tragic-au/weather-api-client
 
 go 1.26.2
 
